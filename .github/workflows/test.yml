@@ -29,6 +29,7 @@ jobs:
 
       - name: Build Android arm64 AAR
         run: |
+          go get golang.org/x/mobile@latest
           mkdir -p dist
           "$(go env GOPATH)/bin/gomobile" bind \
             -target=android/arm64 \
