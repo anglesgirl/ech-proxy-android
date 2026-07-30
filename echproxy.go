@@ -1,7 +1,7 @@
-// Package echproxy provides a reusable on-device ECH HTTP proxy for Android.
-// The caller asks IsAs13335 before routing a request. The proxy repeats the
-// qualification, obtains the request host's own HTTPS ECH record through DoH,
-// and rejects every other host.
+// Package echproxy provides a reusable on-device DoH/ECH HTTP proxy for Android.
+// Every valid target is resolved through DoH. Only targets that resolve entirely
+// to Cloudflare AS13335 and publish their own HTTPS ECH record use ECH; all
+// other targets use ordinary TLS over the DoH-resolved addresses.
 //
 // gomobile-exported surface (basic types only):
 //
@@ -456,14 +456,17 @@ func transportFor(host string) (*http.Transport, error) {
 	} else {
 		log.Printf("echproxy: DoH resolve for %s failed: %v", host, err)
 	}
-	if !hc.as13335 {
-		return nil, fmt.Errorf("%s is not exclusively resolved to AS13335", host)
-	}
-	if b, err := fetchECHViaDoH(host, doh); err == nil && len(b) > 0 {
-		hc.ech = b
-		setConfigInfo("%d bytes for %s, source: DoH", len(b), host)
+	// Non-AS13335 hosts remain on the DoH-resolved direct TLS path. They are
+	// not rejected and never receive the configured Cloudflare edge IP pool.
+	if hc.as13335 {
+		if b, err := fetchECHViaDoH(host, doh); err == nil && len(b) > 0 {
+			hc.ech = b
+			setConfigInfo("%d bytes for %s, source: DoH", len(b), host)
+		} else {
+			setConfigInfo("no ECH for %s; ordinary TLS via DoH", host)
+		}
 	} else {
-		return nil, fmt.Errorf("no ECH HTTPS record for %s: %w", host, err)
+		setConfigInfo("%s is not AS13335; ordinary TLS via DoH", host)
 	}
 	hc.transport = &http.Transport{
 		DialTLSContext:        hostDialContext(host, hc, insecure),
@@ -493,8 +496,10 @@ func hostDialContext(host string, hc *hostConf, insecure bool) func(ctx context.
 		custom := append([]string(nil), customIPs...)
 		mu.Unlock()
 		cands := make([]string, 0, len(custom)+len(hc.ips))
-		for _, ip := range custom {
-			cands = append(cands, net.JoinHostPort(ip, port))
+		if hc.as13335 {
+			for _, ip := range custom {
+				cands = append(cands, net.JoinHostPort(ip, port))
+			}
 		}
 		for _, ip := range hc.ips {
 			cands = append(cands, net.JoinHostPort(ip, port))
