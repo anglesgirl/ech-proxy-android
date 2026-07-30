@@ -20,3 +20,25 @@ jobs:
         run: gofmt -d .
       - name: Test
         run: go test ./...
+
+      - name: Set up gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/gomobile" init
+
+      - name: Build Android arm64 AAR
+        run: |
+          mkdir -p dist
+          "$(go env GOPATH)/bin/gomobile" bind \
+            -target=android/arm64 \
+            -androidapi=24 \
+            -o dist/echproxy.aar \
+            .
+
+      - name: Upload Android AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: echproxy-android-arm64-${{ github.sha }}
+          path: dist/echproxy.aar
+          if-no-files-found: error
