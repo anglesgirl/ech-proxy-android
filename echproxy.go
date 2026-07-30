@@ -52,6 +52,7 @@ var (
 	shakeInfo   string   // last TLS handshake result (ECHAccepted=…)
 	upstreamIPs []string // DoH-resolved upstream addresses, IPv4 first
 	customIPs   []string // user-supplied edge IPs, tried before everything else
+	fallbackECH []byte   // operator-published ECHConfigList for AS13335 targets
 
 	// Per-host state for secondary targets (translation API, mirrors, …) reached
 	// through the same proxy via the X-Ech-Target header.
@@ -247,12 +248,19 @@ func Start(listen, target, echB64, doh, ipList, cachePath string, insecure bool)
 	}
 	mu.Unlock()
 
-	// Generic mode: each requested host is resolved and receives its own
-	// HTTPS/ECH configuration lazily. These legacy arguments remain only for
-	// the gomobile API and are not treated as a fixed bootstrap target.
+	// Generic mode: each requested host is resolved lazily. echB64 is an
+	// operator-published fallback ECHConfigList for AS13335 targets whose own
+	// HTTPS record has no ech= parameter.
 	_ = target
-	_ = echB64
 	_ = cachePath
+	fallback := []byte(nil)
+	if strings.TrimSpace(echB64) != "" {
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(echB64))
+		if err != nil || len(decoded) == 0 {
+			return fmt.Errorf("invalid fallback ECHConfigList: %w", err)
+		}
+		fallback = decoded
+	}
 
 	custom := make([]string, 0)
 	for _, ip := range parseIPList(ipList) {
@@ -262,6 +270,7 @@ func Start(listen, target, echB64, doh, ipList, cachePath string, insecure bool)
 	}
 	mu.Lock()
 	customIPs = custom
+	fallbackECH = fallback
 	upstreamIPs = nil
 	mu.Unlock()
 	setDNSInfo("per-host DoH; ECH only for AS13335-qualified hosts")
@@ -456,14 +465,21 @@ func transportFor(host string) (*http.Transport, error) {
 	} else {
 		log.Printf("echproxy: DoH resolve for %s failed: %v", host, err)
 	}
-	// Non-AS13335 hosts remain on the DoH-resolved direct TLS path. They are
-	// not rejected and never receive the configured Cloudflare edge IP pool.
+	// AS13335 is the ECH qualification. The target's own ech= is preferred;
+	// the operator fallback covers Cloudflare hosts that omit HTTPS ech=.
 	if hc.as13335 {
 		if b, err := fetchECHViaDoH(host, doh); err == nil && len(b) > 0 {
 			hc.ech = b
-			setConfigInfo("%d bytes for %s, source: DoH", len(b), host)
+			setConfigInfo("%d bytes for %s, source: target HTTPS ech=", len(b), host)
 		} else {
-			setConfigInfo("no ECH for %s; ordinary TLS via DoH", host)
+			mu.Lock()
+			hc.ech = append([]byte(nil), fallbackECH...)
+			mu.Unlock()
+			if len(hc.ech) > 0 {
+				setConfigInfo("%d bytes for %s, source: operator fallback", len(hc.ech), host)
+			} else {
+				setConfigInfo("no ECHConfigList for AS13335 host %s", host)
+			}
 		}
 	} else {
 		setConfigInfo("%s is not AS13335; ordinary TLS via DoH", host)
@@ -484,8 +500,9 @@ func transportFor(host string) (*http.Transport, error) {
 	return hc.transport, nil
 }
 
-// hostDialContext dials a secondary host over its DoH-resolved addresses,
-// enabling ECH only when that host actually publishes a config.
+// hostDialContext dials a secondary host over its DoH-resolved addresses.
+// AS13335 hosts always use ECH: their own HTTPS ech= is preferred, otherwise
+// the operator-published fallback ConfigList is used.
 func hostDialContext(host string, hc *hostConf, insecure bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		_, port, err := net.SplitHostPort(addr)
@@ -523,9 +540,13 @@ func hostDialContext(host string, hc *hostConf, insecure bool) func(ctx context.
 			NextProtos:         []string{"h2", "http/1.1"},
 			InsecureSkipVerify: insecure,
 		}
-		if len(hc.ech) > 0 {
+		if hc.as13335 && len(hc.ech) > 0 {
 			cfg.EncryptedClientHelloConfigList = hc.ech
 			cfg.MinVersion = tls.VersionTLS13
+		}
+		if hc.as13335 && len(hc.ech) == 0 {
+			raw.Close()
+			return nil, fmt.Errorf("%s is AS13335 but no ECHConfigList is available", host)
 		}
 		hctx, cancel := context.WithTimeout(ctx, dialTimeout)
 		defer cancel()
@@ -534,10 +555,38 @@ func hostDialContext(host string, hc *hostConf, insecure bool) func(ctx context.
 		if err := tc.HandshakeContext(hctx); err != nil {
 			var rej *tls.ECHRejectionError
 			if errors.As(err, &rej) && len(rej.RetryConfigList) > 0 {
-				setStatus("ECH rejected for %s; server retry_configs ignored", host)
+				// Production routing may accept one server retry config. It is
+				// host-scoped in hc (never promoted to the shared fallback), and
+				// the second attempt still requires ECH rather than plain TLS.
+				raw.Close()
+				setConfigInfo("%d bytes for %s, source: server retry_configs", len(rej.RetryConfigList), host)
+				raw, retryErr := d.DialContext(ctx, "tcp", cands[0])
+				if retryErr != nil {
+					return nil, fmt.Errorf("%s retry dial failed: %w", host, retryErr)
+				}
+				retryConfig := *cfg
+				retryConfig.EncryptedClientHelloConfigList = rej.RetryConfigList
+				retryCtx, retryCancel := context.WithTimeout(ctx, dialTimeout)
+				retryConn := tls.Client(raw, &retryConfig)
+				retryErr = retryConn.HandshakeContext(retryCtx)
+				retryCancel()
+				if retryErr == nil && retryConn.ConnectionState().ECHAccepted {
+					hc.ech = append([]byte(nil), rej.RetryConfigList...)
+					setShakeInfo("ok via %s ECHAccepted=true source=server retry_configs", cands[0])
+					return retryConn, nil
+				}
+				raw.Close()
+				return nil, fmt.Errorf("%s retry ECH handshake failed: %w", host, retryErr)
 			}
 			raw.Close()
 			return nil, fmt.Errorf("%s handshake failed: %w", host, err)
+		}
+		if hc.as13335 && !tc.ConnectionState().ECHAccepted {
+			raw.Close()
+			return nil, fmt.Errorf("%s ECH was not accepted", host)
+		}
+		if hc.as13335 {
+			setShakeInfo("ok via DoH ECHAccepted=true source=%s", orNone(configInfo))
 		}
 		return tc, nil
 	}
