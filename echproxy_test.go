@@ -68,3 +68,15 @@ func TestAllCloudflareAS13335(t *testing.T) {
 		t.Fatal("empty address set must not qualify")
 	}
 }
+
+func TestEchPolicyIsSeparatedFromDirectDoH(t *testing.T) {
+	if HasECH("", "archiveofourown.org") {
+		t.Fatal("missing DoH endpoint must not claim ECH support")
+	}
+	if _, err := Resolve("", "archiveofourown.org"); err == nil {
+		t.Fatal("Resolve must not fall back to system DNS")
+	}
+	if _, err := Resolve("https://example.invalid/dns-query", "bad_.example"); err == nil {
+		t.Fatal("Resolve accepted an invalid host")
+	}
+}

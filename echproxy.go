@@ -167,33 +167,38 @@ func loadAndroidCertPool() *x509.CertPool {
 }
 
 func IsAs13335(doh, host string) bool {
-	if !isTargetHost(host) { return false }
-	ips, err := resolveViaDoH(host, doh)
-	if err != nil || len(ips) == 0 { return false }
-	for _, ip := range ips {
-		if !isAS13335(doh, ip) { return false }
+	if !isTargetHost(host) {
+		return false
 	}
-	return true
+	ips, err := resolveViaDoH(host, doh)
+	if err != nil || len(ips) == 0 {
+		return false
+	}
+	return allCloudflareAS13335(ips)
 }
 
-// isAS13335 uses Team Cymru's DNS ASN service through the same DoH resolver.
-// It is intentionally fail-closed. IPv6 is accepted only for the published
-// Cloudflare AS13335 ranges because Cymru's simple origin lookup is IPv4-only.
-func isAS13335(doh, ip string) bool {
-	parsed := net.ParseIP(ip)
-	if parsed == nil { return false }
-	if parsed.To4() == nil { return isCloudflareAS13335(ip) }
-	octets := strings.Split(parsed.To4().String(), ".")
-	reverse := octets[3]+"."+octets[2]+"."+octets[1]+"."+octets[0]+".origin.asn.cymru.com"
-	dr, err := dohQuery(doh, reverse, "TXT")
-	if err != nil { return false }
-	for _, answer := range dr.Answer {
-		if answer.Type != 16 { continue }
-		value := strings.Trim(strings.TrimSpace(answer.Data), `"`)
-		asn := strings.TrimSpace(strings.SplitN(value, "|", 2)[0])
-		if asn == "13335" { return true }
+// HasECH reports whether the target publishes its own HTTPS ECH configuration.
+// It is independent from AS qualification: callers use ordinary DoH resolution
+// for hosts that are not ECH-capable.
+func HasECH(doh, host string) bool {
+	if !isTargetHost(host) {
+		return false
 	}
-	return false
+	config, err := fetchECHViaDoH(host, doh)
+	return err == nil && len(config) > 0
+}
+
+// Resolve returns DoH-resolved A/AAAA addresses as a comma-separated string
+// for gomobile callers. It never falls back to Android/system DNS.
+func Resolve(doh, host string) (string, error) {
+	if !isTargetHost(host) {
+		return "", errors.New("invalid target host")
+	}
+	ips, err := resolveViaDoH(host, doh)
+	if err != nil {
+		return "", err
+	}
+	return strings.Join(ips, ","), nil
 }
 
 // isCloudflareAS13335 checks the published IPv4 and IPv6 CIDRs assigned to
@@ -524,18 +529,7 @@ func hostDialContext(host string, hc *hostConf, insecure bool) func(ctx context.
 		if err := tc.HandshakeContext(hctx); err != nil {
 			var rej *tls.ECHRejectionError
 			if errors.As(err, &rej) && len(rej.RetryConfigList) > 0 {
-				raw.Close()
-				raw2, derr := d.DialContext(ctx, "tcp", cands[0])
-				if derr != nil {
-					return nil, derr
-				}
-				cfg.EncryptedClientHelloConfigList = rej.RetryConfigList
-				tc = tls.Client(raw2, cfg)
-				if err2 := tc.HandshakeContext(hctx); err2 != nil {
-					raw2.Close()
-					return nil, fmt.Errorf("%s handshake failed: %w", host, err2)
-				}
-				return tc, nil
+				setStatus("ECH rejected for %s; server retry_configs ignored", host)
 			}
 			raw.Close()
 			return nil, fmt.Errorf("%s handshake failed: %w", host, err)
@@ -624,22 +618,12 @@ func echDialContext(sni string, echList []byte, cachePath string, insecure bool)
 			err = tc.HandshakeContext(hctx)
 			cancel()
 
-			// A server-provided retry config is the only ECH retry on this edge.
-			// Persist it and also use it for later candidate IPs in this attempt.
+			// Do not use server retry_configs. This proxy validates the ECH
+			// configuration obtained for the target host itself, without silently
+			// switching to a server-provided configuration.
 			var rej *tls.ECHRejectionError
 			if errors.As(err, &rej) && len(rej.RetryConfigList) > 0 {
-				raw.Close()
-				setStatus("ECH rejected via %s; retrying with server retry_configs (%d bytes)", dialed, len(rej.RetryConfigList))
-				echList = rej.RetryConfigList
-				storePublicECHCache(cachePath, sni, rej.RetryConfigList)
-				raw, err = d.DialContext(ctx, "tcp", dialed)
-				if err == nil {
-					cfg.EncryptedClientHelloConfigList = echList
-					hctx, retryCancel := context.WithTimeout(ctx, dialTimeout)
-					tc = tls.Client(raw, cfg)
-					err = tc.HandshakeContext(hctx)
-					retryCancel()
-				}
+				setStatus("ECH rejected via %s; server retry_configs ignored", dialed)
 			}
 			if err != nil {
 				raw.Close()
