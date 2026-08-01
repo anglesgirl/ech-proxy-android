@@ -542,6 +542,7 @@ func hostDialContext(host string, hc *hostConf, insecure bool) func(ctx context.
 			MinVersion:         tls.VersionTLS12,
 			NextProtos:         []string{"h2", "http/1.1"},
 			InsecureSkipVerify: insecure,
+			RootCAs:            loadAndroidCertPool(),
 		}
 		if hc.as13335 && len(hc.ech) > 0 {
 			cfg.EncryptedClientHelloConfigList = hc.ech
@@ -710,6 +711,129 @@ type dohResp struct {
 	} `json:"Answer"`
 }
 
+// Bootstrap DNS servers used to resolve the DoH server's own hostname.
+//
+// CGO_ENABLED=0 Go binaries on Android cannot use the system DNS resolver
+// (it tries [::1]:53 which is Android's local DNS proxy, unreachable from
+// pure-Go code). Hard-coded DNS IPs break the chicken-and-egg problem:
+// we need DNS to look up the DoH server, but DoH is our DNS.
+//
+// Order: Alibaba Cloud, Tencent Cloud, 360 — all mainland-China friendly
+// and reachable from most networks.
+var bootstrapDNSServers = []string{
+	"223.5.5.5:53",        // 阿里云公共 DNS
+	"223.6.6.6:53",        // 阿里云公共 DNS 备选
+	"119.29.29.29:53",     // 腾讯云 DNSPod
+	"182.254.116.116:53",  // 腾讯云 DNSPod 备选
+	"101.226.4.6:53",      // 360 DNS
+	"218.30.118.6:53",     // 360 DNS 备选
+}
+
+// bootstrapResolve resolves a hostname using the bootstrap DNS servers via UDP.
+// Only used to resolve the DoH server's own hostname.
+func bootstrapResolve(host string) (string, error) {
+	var lastErr error
+	for _, server := range bootstrapDNSServers {
+		ip, err := lookupHostUDP(host, server)
+		if err == nil && ip != "" {
+			return ip, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no bootstrap DNS result for %s", host)
+	}
+	return "", lastErr
+}
+
+// lookupHostUDP performs a minimal A-record DNS lookup over UDP.
+// Hand-rolled to avoid pulling in a full DNS client library.
+func lookupHostUDP(host, server string) (string, error) {
+	d := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := d.Dial("udp", server)
+	if err != nil {
+		return "", fmt.Errorf("dial %s: %w", server, err)
+	}
+	defer conn.Close()
+
+	// Build a minimal DNS query: ID=0, flags=0x0100 (RD=1), 1 question
+	msg := make([]byte, 12+len(host)+2+4)
+	msg[2] = 0x01 // flags high byte: RD
+	msg[5] = 0x01 // QDCOUNT = 1
+
+	pos := 12
+	for _, label := range strings.Split(host, ".") {
+		msg[pos] = byte(len(label))
+		pos++
+		copy(msg[pos:], label)
+		pos += len(label)
+	}
+	msg[pos] = 0 // terminating zero-length label
+	pos++
+	msg[pos] = 0x00  // QTYPE = A
+	msg[pos+1] = 0x01
+	pos += 2
+	msg[pos] = 0x00  // QCLASS = IN
+	msg[pos+1] = 0x01
+
+	_, err = conn.Write(msg[:pos+2])
+	if err != nil {
+		return "", fmt.Errorf("write DNS query: %w", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 512)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return "", fmt.Errorf("read DNS response: %w", err)
+	}
+	if n < 12 {
+		return "", fmt.Errorf("DNS response too short: %d bytes", n)
+	}
+	if buf[3]&0x0F != 0 {
+		return "", fmt.Errorf("DNS rcode=%d", buf[3]&0x0F)
+	}
+
+	// Skip header (12 bytes) + question section
+	p := 12
+	for p < n && buf[p] != 0 {
+		p += int(buf[p]) + 1
+	}
+	p += 5 // null byte + QTYPE + QCLASS
+
+	answers := 0
+	for p < n && answers < 10 {
+		if p+12 > n {
+			break
+		}
+		// Skip name (pointer or labels)
+		if buf[p]&0xC0 == 0xC0 {
+			p += 2
+		} else {
+			for p < n && buf[p] != 0 {
+				p += int(buf[p]) + 1
+			}
+			p++
+		}
+		if p+10 > n {
+			break
+		}
+		rtype := int(buf[p])<<8 | int(buf[p+1])
+		rdlen := int(buf[p+8])<<8 | int(buf[p+9])
+		p += 10
+		if p+rdlen > n {
+			break
+		}
+		if rtype == 1 && rdlen == 4 { // A record
+			return net.IP(buf[p : p+4]).String(), nil
+		}
+		p += rdlen
+		answers++
+	}
+
+	return "", fmt.Errorf("no A record for %s", host)
+}
+
 // dohQuery performs a DoH JSON query and returns the answer records.
 func dohQuery(endpoint, name, qtype string) (*dohResp, error) {
 	var lastErr error
@@ -731,8 +855,34 @@ func dohQuery(endpoint, name, qtype string) (*dohResp, error) {
 			continue
 		}
 		req.Header.Set("accept", "application/dns-json")
-		transport := &http.Transport{}
-		if pool := loadAndroidCertPool(); pool != nil { transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12} }
+
+		// Transport with bootstrap DNS for the DoH server hostname.
+		// On Android (CGO_ENABLED=0), the system resolver doesn't work,
+		// so we resolve the DoH server's hostname ourselves via UDP to
+		// hard-coded bootstrap DNS IPs.
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				// Already an IP — dial directly
+				if net.ParseIP(host) != nil {
+					d := &net.Dialer{Timeout: dialTimeout}
+					return d.DialContext(ctx, network, addr)
+				}
+				// Resolve hostname via bootstrap DNS
+				ip, err := bootstrapResolve(host)
+				if err != nil {
+					return nil, fmt.Errorf("bootstrap DNS resolve %s: %w", host, err)
+				}
+				d := &net.Dialer{Timeout: dialTimeout}
+				return d.DialContext(ctx, network, net.JoinHostPort(ip, port))
+			},
+		}
+		if pool := loadAndroidCertPool(); pool != nil {
+			transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+		}
 		resp, err := (&http.Client{Timeout: dialTimeout, Transport: transport}).Do(req)
 		if err != nil {
 			lastErr = err
